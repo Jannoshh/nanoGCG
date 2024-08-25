@@ -10,6 +10,7 @@ import torch
 import transformers
 from torch import Tensor
 from transformers import set_seed
+import einops
 
 from nanogcg.utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, mellowmax
 
@@ -33,8 +34,11 @@ class GCGConfig:
     topk: int = 256
     n_replace: int = 1
     buffer_size: int = 0
+    use_crossentropy: bool = True
     use_mellowmax: bool = False
     mellowmax_alpha: float = 1.0
+    use_directional_ablation: bool = False
+    directional_ablation_weight: float = 1
     use_prefix_cache: bool = True
     allow_non_ascii: bool = False
     filter_ids: bool = True
@@ -47,6 +51,7 @@ class GCGResult:
     best_loss: float
     best_string: str
     losses: List[float]
+    aux_losses: List[float]
     strings: List[str]
 
 class AttackBuffer:
@@ -54,20 +59,20 @@ class AttackBuffer:
         self.buffer = [] # elements are (loss: float, optim_ids: Tensor)
         self.size = size
 
-    def add(self, loss: float, optim_ids: Tensor) -> None:
+    def add(self, loss: float, aux_loss: None | float, optim_ids: Tensor) -> None:
         if self.size == 0:
-            self.buffer = [(loss, optim_ids)]
+            self.buffer = [(loss, aux_loss, optim_ids)]
             return
 
         if len(self.buffer) < self.size:
-            self.buffer.append((loss, optim_ids))
+            self.buffer.append((loss, aux_loss, optim_ids))
             return
 
-        self.buffer[-1] = (loss, optim_ids)
+        self.buffer[-1] = (loss, aux_loss, optim_ids)
         self.buffer.sort(key=lambda x: x[0])
 
     def get_best_ids(self) -> Tensor:
-        return self.buffer[0][1]
+        return self.buffer[0][2]
 
     def get_lowest_loss(self) -> float:
         return self.buffer[0][0]
@@ -77,11 +82,11 @@ class AttackBuffer:
     
     def log_buffer(self, tokenizer):
         message = "buffer:"
-        for loss, ids in self.buffer:
+        for loss, aux_loss, ids in self.buffer:
             optim_str = tokenizer.batch_decode(ids)[0]
             optim_str = optim_str.replace("\\", "\\\\")
             optim_str = optim_str.replace("\n", "\\n")
-            message += f"\nloss: {loss}" + f" | string: {optim_str}"
+            message += f"\nloss: {loss} | aux_loss: {aux_loss} | string: {optim_str}"
         logger.info(message)
 
 def sample_ids_from_grad(
@@ -168,10 +173,13 @@ class GCG:
         model: transformers.PreTrainedModel,
         tokenizer: transformers.PreTrainedTokenizer,
         config: GCGConfig,
+        ablation_direction: Optional[Tensor] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
+        ablation_direction = ablation_direction / ablation_direction.norm() if ablation_direction is not None else None
+        self.ablation_direction = ablation_direction.to(model.device).to(model.dtype) if ablation_direction is not None else None
 
         self.embedding_layer = model.get_input_embeddings()
         self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=model.device)
@@ -233,11 +241,14 @@ class GCG:
         self.after_embeds = after_embeds
         self.target_embeds = target_embeds
 
+        self.ablation_tokens = self.after_embeds.shape[1] + self.target_embeds.shape[1]
+
         # Initialize the attack buffer
         buffer = self.init_buffer()
         optim_ids = buffer.get_best_ids()
 
         losses = []
+        aux_losses = []
         optim_strings = []
         
         for _ in tqdm(range(config.num_steps)):
@@ -276,15 +287,17 @@ class GCG:
                         after_embeds.repeat(new_search_width, 1, 1),
                         target_embeds.repeat(new_search_width, 1, 1),
                     ], dim=1)
-                loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
+                loss, aux_loss = find_executable_batch_size(self.compute_candidates_loss, batch_size)(input_embeds)
 
                 current_loss = loss.min().item()
+                current_aux_loss = aux_loss.min().item()
                 optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
 
                 # Update the buffer based on the loss
                 losses.append(current_loss)
+                aux_losses.append(current_aux_loss)
                 if buffer.size == 0 or current_loss < buffer.get_highest_loss():
-                    buffer.add(current_loss, optim_ids)
+                    buffer.add(current_loss, current_aux_loss, optim_ids)
 
             optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
@@ -298,6 +311,7 @@ class GCG:
             best_loss=losses[min_loss_index],
             best_string=optim_strings[min_loss_index],
             losses=losses,
+            aux_losses=aux_losses,
             strings=optim_strings,
         )
 
@@ -347,11 +361,11 @@ class GCG:
                 self.target_embeds.repeat(true_buffer_size, 1, 1),
             ], dim=1)
 
-        init_buffer_losses = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds)
+        init_buffer_losses, init_buffer_aux_losses = find_executable_batch_size(self.compute_candidates_loss, true_buffer_size)(init_buffer_embeds)
 
         # Populate the buffer
         for i in range(true_buffer_size):
-            buffer.add(init_buffer_losses[i], init_buffer_ids[[i]])
+            buffer.add(init_buffer_losses[i], init_buffer_aux_losses[i], init_buffer_ids[[i]])
 
         logger.info("Initialized attack buffer.")
         
@@ -378,14 +392,16 @@ class GCG:
         # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
         optim_embeds = optim_ids_onehot @ embedding_layer.weight
 
+        output_hidden_states = self.config.use_directional_ablation
         if self.prefix_cache:
             input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-            output = model(inputs_embeds=input_embeds, past_key_values=self.prefix_cache)
+            output = model(inputs_embeds=input_embeds, past_key_values=self.prefix_cache, output_hidden_states=output_hidden_states)
         else:
             input_embeds = torch.cat([self.before_embeds, optim_embeds, self.after_embeds, self.target_embeds], dim=1)
-            output = model(inputs_embeds=input_embeds)
+            output = model(inputs_embeds=input_embeds, output_hidden_states=output_hidden_states)
 
         logits = output.logits
+        hidden_states = output.hidden_states
 
         # Shift logits so token n-1 predicts token n
         shift = input_embeds.shape[1] - self.target_ids.shape[1]
@@ -395,8 +411,20 @@ class GCG:
         if self.config.use_mellowmax:
             label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
             loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-        else:
+        elif self.config.use_crossentropy:
             loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        else:
+            loss = torch.zeros(1, device=logits.device)
+        if self.config.use_directional_ablation:
+            hs = torch.stack(hidden_states, dim=1)
+            hidden_state = hs[:, 1:, -self.ablation_tokens:, :]
+            hidden_state = hidden_state / hidden_state.norm(dim=-1, keepdim=True)
+            aux_loss = einops.einsum(
+                hidden_state, self.ablation_direction.view(-1, 1), "... d_act, d_act single -> ... single"
+            )
+            # aux_loss = torch.nn.functional.cosine_similarity(hidden_state, self.ablation_direction.view(1, -1), dim=-1)
+            aux_loss = aux_loss.abs().mean()
+            loss += self.config.directional_ablation_weight * aux_loss
 
         optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
 
@@ -416,8 +444,10 @@ class GCG:
                 the embeddings of the `search_width` candidate sequences to evaluate
         """
         all_loss = []
+        all_aux_loss = []
         prefix_cache_batch = []
 
+        output_hidden_states = self.config.use_directional_ablation
         for i in range(0, input_embeds.shape[0], search_batch_size):
             with torch.no_grad():
                 input_embeds_batch = input_embeds[i:i+search_batch_size]
@@ -427,11 +457,12 @@ class GCG:
                     if not prefix_cache_batch or current_batch_size != search_batch_size:
                         prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
 
-                    outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch)
+                    outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, output_hidden_states=output_hidden_states)
                 else:
-                    outputs = self.model(inputs_embeds=input_embeds_batch)
+                    outputs = self.model(inputs_embeds=input_embeds_batch, output_hidden_states=output_hidden_states)
 
                 logits = outputs.logits
+                output_hidden_states = outputs.hidden_states
 
                 tmp = input_embeds.shape[1] - self.target_ids.shape[1]
                 shift_logits = logits[..., tmp-1:-1, :].contiguous()
@@ -440,17 +471,33 @@ class GCG:
                 if self.config.use_mellowmax:
                     label_logits = torch.gather(shift_logits, -1, shift_labels.unsqueeze(-1)).squeeze(-1)
                     loss = mellowmax(-label_logits, alpha=self.config.mellowmax_alpha, dim=-1)
-                else:
+                elif self.config.use_crossentropy:
                     loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), reduction="none")
+                else:
+                    loss = torch.zeros(current_batch_size, device=logits.device)
 
                 loss = loss.view(current_batch_size, -1).mean(dim=-1)
+                aux_loss = torch.zeros_like(loss)
+                if self.config.use_directional_ablation:
+                    hs = torch.stack(output_hidden_states, dim=1)
+                    hidden_state = hs[:, 1:, -self.ablation_tokens:, :].squeeze()
+                    hidden_state = hidden_state / hidden_state.norm(dim=-1, keepdim=True)
+                    aux_loss = einops.einsum(
+                        hidden_state, self.ablation_direction.view(-1, 1), "... d_act, d_act single -> ... single"
+                    )
+                    aux_loss = aux_loss.view(current_batch_size, -1).abs().mean(dim=-1)
+                    # aux_loss = torch.nn.functional.cosine_similarity(hidden_state, self.ablation_direction.view(1, -1), dim=-1)
+                    # aux_loss = aux_loss.view(current_batch_size, -1).mean(dim=-1)
+                    loss += self.config.directional_ablation_weight * aux_loss
+
                 all_loss.append(loss)
+                all_aux_loss.append(aux_loss)
 
                 del outputs
                 gc.collect()
                 torch.cuda.empty_cache()
 
-        return torch.cat(all_loss, dim=0)
+        return torch.cat(all_loss, dim=0), torch.cat(all_aux_loss, dim=0)
 
 # A wrapper around the GCG `run` method that provides a simple API
 def run(
@@ -459,6 +506,7 @@ def run(
     messages: Union[str, List[dict]],
     target: str,
     config: Optional[GCGConfig] = None, 
+    ablation_direction: Optional[Tensor] = None,
 ) -> GCGResult:
     """Generates a single optimized string using GCG. 
 
@@ -477,7 +525,7 @@ def run(
     
     logger.setLevel(getattr(logging, config.verbosity))
     
-    gcg = GCG(model, tokenizer, config)
+    gcg = GCG(model, tokenizer, config, ablation_direction)
     result = gcg.run(messages, target)
     return result
     
