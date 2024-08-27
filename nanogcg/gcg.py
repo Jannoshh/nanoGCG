@@ -38,6 +38,7 @@ class GCGConfig:
     use_mellowmax: bool = False
     mellowmax_alpha: float = 1.0
     use_directional_ablation: bool = False
+    directional_ablation_mode: str = "current"
     make_activation_orthogonal: bool = False
     aux_loss_weight: float = 1
     target_tokens: int | None = None
@@ -432,7 +433,18 @@ class GCG:
         if self.config.use_directional_ablation:
             hs = torch.stack(hidden_states, dim=1)
             hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
-            aux_loss = (self.target_hidden_state - hidden_state).square().mean()
+            if self.config.directional_ablation_mode == "initial":
+                aux_loss = (self.target_hidden_state - hidden_state).square().mean()
+            elif self.config.directional_ablation_mode == "current":
+                dot_product = (
+                    einops.einsum(
+                        hidden_state, self.direction.view(-1, 1), "... d_act, d_act single -> ... single"
+                    )
+                )
+                # dot_product = torch.nn.functional.cosine_similarity(hidden_state, self.direction, dim=-1)
+                aux_loss = dot_product.square().mean()
+            else:
+                raise ValueError(f"Invalid directional_ablation_mode: {self.config.directional_ablation_mode}")
             loss += self.config.aux_loss_weight * aux_loss
         elif self.config.make_activation_orthogonal:
             hs = torch.stack(hidden_states, dim=1)
@@ -499,8 +511,19 @@ class GCG:
                         self.normal_hidden_state = hs[:, self.target_layers, -self.target_tokens:, :].detach().clone().to(self.model.device)
                         self.target_hidden_state = self.normal_hidden_state - projection(self.normal_hidden_state, self.direction)
                     hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
-                    target_hidden_state = self.target_hidden_state.expand(current_batch_size, -1, -1, -1)
-                    aux_loss = (target_hidden_state - hidden_state).square()
+                    if self.config.directional_ablation_mode == "initial":
+                        target_hidden_state = self.target_hidden_state.expand(current_batch_size, -1, -1, -1)
+                        aux_loss = (target_hidden_state - hidden_state).square()
+                    elif self.config.directional_ablation_mode == "current":
+                        dot_product = (
+                            einops.einsum(
+                                hidden_state, self.direction.view(-1, 1), "... d_act, d_act single -> ... single"
+                            )
+                        )
+                        # dot_product = torch.nn.functional.cosine_similarity(hidden_state, self.direction, dim=-1)
+                        aux_loss = dot_product.square()
+                    else:
+                        raise ValueError(f"Invalid directional_ablation_mode: {self.config.directional_ablation_mode}")
                     aux_loss = aux_loss.view(current_batch_size, -1).mean(dim=-1)
                     loss += self.config.aux_loss_weight * aux_loss
                 elif self.config.make_activation_orthogonal:
