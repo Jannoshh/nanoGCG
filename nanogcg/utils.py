@@ -2,6 +2,7 @@ import functools
 import gc
 import inspect
 import torch
+import einops
 from torch import Tensor
 
 INIT_CHARS = [
@@ -9,6 +10,15 @@ INIT_CHARS = [
     "@", "#", "$", "%", "&", "*",
     "w", "x", "y", "z",
 ]
+
+def projection(activation, direction):
+    proj = (
+        einops.einsum(
+            activation, direction.view(-1, 1), "... d_act, d_act single -> ... single"
+        )
+        * direction
+    )
+    return proj
 
 def get_nonascii_toks(tokenizer, device="cpu"):
 

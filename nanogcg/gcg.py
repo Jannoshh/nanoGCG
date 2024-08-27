@@ -12,7 +12,7 @@ from torch import Tensor
 from transformers import set_seed
 import einops
 
-from nanogcg.utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, mellowmax
+from nanogcg.utils import INIT_CHARS, find_executable_batch_size, get_nonascii_toks, mellowmax, projection
 
 logger = logging.getLogger("nanogcg")
 if not logger.hasHandlers():
@@ -38,7 +38,10 @@ class GCGConfig:
     use_mellowmax: bool = False
     mellowmax_alpha: float = 1.0
     use_directional_ablation: bool = False
-    directional_ablation_weight: float = 1
+    make_activation_orthogonal: bool = False
+    aux_loss_weight: float = 1
+    target_tokens: int | None = None
+    target_layers: slice = None 
     use_prefix_cache: bool = True
     allow_non_ascii: bool = False
     filter_ids: bool = True
@@ -173,17 +176,18 @@ class GCG:
         model: transformers.PreTrainedModel,
         tokenizer: transformers.PreTrainedTokenizer,
         config: GCGConfig,
-        ablation_direction: Optional[Tensor] = None,
+        direction: Optional[Tensor] = None,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
-        ablation_direction = ablation_direction / ablation_direction.norm() if ablation_direction is not None else None
-        self.ablation_direction = ablation_direction.to(model.device).to(model.dtype) if ablation_direction is not None else None
+        direction = direction / direction.norm() if direction is not None else None
+        self.direction = direction.to(model.device).to(model.dtype) if direction is not None else None
 
         self.embedding_layer = model.get_input_embeddings()
         self.not_allowed_ids = None if config.allow_non_ascii else get_nonascii_toks(tokenizer, device=model.device)
         self.prefix_cache = None
+        self.normal_hidden_state = None
 
         if model.dtype in (torch.float32, torch.float64):
             logger.warning(f"Model is in {model.dtype}. Use a lower precision data type, if possible, for much faster optimization.")
@@ -235,13 +239,23 @@ class GCG:
             with torch.no_grad():
                 output = model(inputs_embeds=before_embeds, use_cache=True)
                 self.prefix_cache = output.past_key_values
-        
+
         self.target_ids = target_ids
         self.before_embeds = before_embeds
         self.after_embeds = after_embeds
         self.target_embeds = target_embeds
 
-        self.ablation_tokens = self.after_embeds.shape[1] + self.target_embeds.shape[1]
+        if config.target_tokens is None:
+            self.target_tokens = self.after_embeds.shape[1] + self.target_embeds.shape[1] # post-suffix tokens
+        else:
+            self.target_tokens = config.target_tokens
+        
+        if (self.config.use_directional_ablation or self.config.make_activation_orthogonal) and self.config.target_layers is None:
+            target_layer = model.config.num_hidden_layers // 2 - 1
+            self.target_layers = slice(target_layer, target_layer + 1)
+            print(f"Warning: target_layers is not set. Using the middle layer {self.target_layers}")
+        else:
+            self.target_layers = self.config.target_layers
 
         # Initialize the attack buffer
         buffer = self.init_buffer()
@@ -392,7 +406,7 @@ class GCG:
         # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
         optim_embeds = optim_ids_onehot @ embedding_layer.weight
 
-        output_hidden_states = self.config.use_directional_ablation
+        output_hidden_states = self.config.use_directional_ablation or self.config.make_activation_orthogonal
         if self.prefix_cache:
             input_embeds = torch.cat([optim_embeds, self.after_embeds, self.target_embeds], dim=1)
             output = model(inputs_embeds=input_embeds, past_key_values=self.prefix_cache, output_hidden_states=output_hidden_states)
@@ -417,14 +431,15 @@ class GCG:
             loss = torch.zeros(1, device=logits.device)
         if self.config.use_directional_ablation:
             hs = torch.stack(hidden_states, dim=1)
-            hidden_state = hs[:, 1:, -self.ablation_tokens:, :]
-            hidden_state = hidden_state / hidden_state.norm(dim=-1, keepdim=True)
-            aux_loss = einops.einsum(
-                hidden_state, self.ablation_direction.view(-1, 1), "... d_act, d_act single -> ... single"
-            )
-            # aux_loss = torch.nn.functional.cosine_similarity(hidden_state, self.ablation_direction.view(1, -1), dim=-1)
-            aux_loss = aux_loss.abs().mean()
-            loss += self.config.directional_ablation_weight * aux_loss
+            hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
+            aux_loss = (self.target_hidden_state - hidden_state).square().mean()
+            loss += self.config.aux_loss_weight * aux_loss
+        elif self.config.make_activation_orthogonal:
+            hs = torch.stack(hidden_states, dim=1)
+            hidden_state = hs[0, self.target_layers, -self.target_tokens:, :]
+            hidden_state_differences = hidden_state - self.normal_hidden_state
+            orthogonality_loss = torch.nn.functional.cosine_similarity(hidden_state_differences, self.direction, dim=-1).abs().mean()
+            loss += self.config.aux_loss_weight * orthogonality_loss
 
         optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
 
@@ -447,7 +462,7 @@ class GCG:
         all_aux_loss = []
         prefix_cache_batch = []
 
-        output_hidden_states = self.config.use_directional_ablation
+        output_hidden_states = self.config.use_directional_ablation or self.config.make_activation_orthogonal
         for i in range(0, input_embeds.shape[0], search_batch_size):
             with torch.no_grad():
                 input_embeds_batch = input_embeds[i:i+search_batch_size]
@@ -462,7 +477,7 @@ class GCG:
                     outputs = self.model(inputs_embeds=input_embeds_batch, output_hidden_states=output_hidden_states)
 
                 logits = outputs.logits
-                output_hidden_states = outputs.hidden_states
+                hidden_states = outputs.hidden_states
 
                 tmp = input_embeds.shape[1] - self.target_ids.shape[1]
                 shift_logits = logits[..., tmp-1:-1, :].contiguous()
@@ -479,16 +494,24 @@ class GCG:
                 loss = loss.view(current_batch_size, -1).mean(dim=-1)
                 aux_loss = torch.zeros_like(loss)
                 if self.config.use_directional_ablation:
-                    hs = torch.stack(output_hidden_states, dim=1)
-                    hidden_state = hs[:, 1:, -self.ablation_tokens:, :].squeeze()
-                    hidden_state = hidden_state / hidden_state.norm(dim=-1, keepdim=True)
-                    aux_loss = einops.einsum(
-                        hidden_state, self.ablation_direction.view(-1, 1), "... d_act, d_act single -> ... single"
-                    )
-                    aux_loss = aux_loss.view(current_batch_size, -1).abs().mean(dim=-1)
-                    # aux_loss = torch.nn.functional.cosine_similarity(hidden_state, self.ablation_direction.view(1, -1), dim=-1)
-                    # aux_loss = aux_loss.view(current_batch_size, -1).mean(dim=-1)
-                    loss += self.config.directional_ablation_weight * aux_loss
+                    hs = torch.stack(hidden_states, dim=1)
+                    if self.normal_hidden_state is None:
+                        self.normal_hidden_state = hs[:, self.target_layers, -self.target_tokens:, :].detach().clone().to(self.model.device)
+                        self.target_hidden_state = self.normal_hidden_state - projection(self.normal_hidden_state, self.direction)
+                    hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
+                    target_hidden_state = self.target_hidden_state.expand(current_batch_size, -1, -1, -1)
+                    aux_loss = (target_hidden_state - hidden_state).square()
+                    aux_loss = aux_loss.view(current_batch_size, -1).mean(dim=-1)
+                    loss += self.config.aux_loss_weight * aux_loss
+                elif self.config.make_activation_orthogonal:
+                    hs = torch.stack(hidden_states, dim=1)
+                    if self.normal_hidden_state is None:
+                        self.normal_hidden_state = hs[0, self.target_layers, -self.target_tokens:, :].detach().clone().to(self.model.device)
+                    hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
+                    hidden_state_differences = hidden_state - self.normal_hidden_state
+                    orthogonality_loss = torch.nn.functional.cosine_similarity(hidden_state_differences, self.direction, dim=-1).abs().mean(dim=-1)
+                    aux_loss = orthogonality_loss
+                    loss += self.config.aux_loss_weight * aux_loss
 
                 all_loss.append(loss)
                 all_aux_loss.append(aux_loss)
@@ -506,7 +529,7 @@ def run(
     messages: Union[str, List[dict]],
     target: str,
     config: Optional[GCGConfig] = None, 
-    ablation_direction: Optional[Tensor] = None,
+    direction: Optional[Tensor] = None,
 ) -> GCGResult:
     """Generates a single optimized string using GCG. 
 
@@ -525,7 +548,7 @@ def run(
     
     logger.setLevel(getattr(logging, config.verbosity))
     
-    gcg = GCG(model, tokenizer, config, ablation_direction)
+    gcg = GCG(model, tokenizer, config, direction)
     result = gcg.run(messages, target)
     return result
     
