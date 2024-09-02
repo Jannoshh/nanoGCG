@@ -41,6 +41,7 @@ class GCGConfig:
     directional_ablation_mode: str = "current"
     make_activation_orthogonal: bool = False
     aux_loss_weight: float = 1
+    use_aux_loss_for_token_gradients: bool = True
     target_tokens: int | None = None
     target_layers: slice = None 
     use_prefix_cache: bool = True
@@ -430,28 +431,22 @@ class GCG:
             loss = torch.nn.functional.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
         else:
             loss = torch.zeros(1, device=logits.device)
-        if self.config.use_directional_ablation:
+
+        if self.config.use_aux_loss_for_token_gradients:
             hs = torch.stack(hidden_states, dim=1)
             hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
-            if self.config.directional_ablation_mode == "initial":
+            if self.config.use_directional_ablation and self.config.directional_ablation_mode == "initial":
                 aux_loss = (self.target_hidden_state - hidden_state).square().mean()
-            elif self.config.directional_ablation_mode == "current":
-                dot_product = (
-                    einops.einsum(
-                        hidden_state, self.direction.view(-1, 1), "... d_act, d_act single -> ... single"
-                    )
-                )
-                # dot_product = torch.nn.functional.cosine_similarity(hidden_state, self.direction, dim=-1)
-                aux_loss = dot_product.square().mean()
+            elif self.config.use_directional_ablation and self.config.directional_ablation_mode == "current":
+                cosine_sim = torch.nn.functional.cosine_similarity(hidden_state, self.direction, dim=-1)
+                aux_loss = cosine_sim.abs().mean()
+            elif self.config.make_activation_orthogonal:
+                hidden_state_differences = hidden_state - self.normal_hidden_state
+                cosine_sim = torch.nn.functional.cosine_similarity(hidden_state_differences, self.direction, dim=-1)
+                aux_loss = cosine_sim.abs().mean()
             else:
-                raise ValueError(f"Invalid directional_ablation_mode: {self.config.directional_ablation_mode}")
+                raise ValueError("What are you doing...")
             loss += self.config.aux_loss_weight * aux_loss
-        elif self.config.make_activation_orthogonal:
-            hs = torch.stack(hidden_states, dim=1)
-            hidden_state = hs[0, self.target_layers, -self.target_tokens:, :]
-            hidden_state_differences = hidden_state - self.normal_hidden_state
-            orthogonality_loss = torch.nn.functional.cosine_similarity(hidden_state_differences, self.direction, dim=-1).abs().mean()
-            loss += self.config.aux_loss_weight * orthogonality_loss
 
         optim_ids_onehot_grad = torch.autograd.grad(outputs=[loss], inputs=[optim_ids_onehot])[0]
 
@@ -505,35 +500,26 @@ class GCG:
 
                 loss = loss.view(current_batch_size, -1).mean(dim=-1)
                 aux_loss = torch.zeros_like(loss)
-                if self.config.use_directional_ablation:
+                if self.config.use_directional_ablation or self.config.make_activation_orthogonal:
                     hs = torch.stack(hidden_states, dim=1)
                     if self.normal_hidden_state is None:
                         self.normal_hidden_state = hs[:, self.target_layers, -self.target_tokens:, :].detach().clone().to(self.model.device)
                         self.target_hidden_state = self.normal_hidden_state - projection(self.normal_hidden_state, self.direction)
                     hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
-                    if self.config.directional_ablation_mode == "initial":
+                    if self.config.use_directional_ablation and self.config.directional_ablation_mode == "initial":
                         target_hidden_state = self.target_hidden_state.expand(current_batch_size, -1, -1, -1)
                         aux_loss = (target_hidden_state - hidden_state).square()
-                    elif self.config.directional_ablation_mode == "current":
-                        dot_product = (
-                            einops.einsum(
-                                hidden_state, self.direction.view(-1, 1), "... d_act, d_act single -> ... single"
-                            )
-                        )
-                        # dot_product = torch.nn.functional.cosine_similarity(hidden_state, self.direction, dim=-1)
-                        aux_loss = dot_product.square()
+                    elif self.config.use_directional_ablation and self.config.directional_ablation_mode == "current":
+                        dot_product = torch.nn.functional.cosine_similarity(hidden_state, self.direction, dim=-1)
+                        aux_loss = dot_product.abs()
+                    elif self.config.make_activation_orthogonal:
+                        normal_hidden_state = self.normal_hidden_state.expand(current_batch_size, -1, -1, -1)
+                        hidden_state_differences = hidden_state - normal_hidden_state
+                        dot_product = torch.nn.functional.cosine_similarity(hidden_state_differences, self.direction, dim=-1)
+                        aux_loss = dot_product.abs()
                     else:
-                        raise ValueError(f"Invalid directional_ablation_mode: {self.config.directional_ablation_mode}")
+                        raise ValueError("?")
                     aux_loss = aux_loss.view(current_batch_size, -1).mean(dim=-1)
-                    loss += self.config.aux_loss_weight * aux_loss
-                elif self.config.make_activation_orthogonal:
-                    hs = torch.stack(hidden_states, dim=1)
-                    if self.normal_hidden_state is None:
-                        self.normal_hidden_state = hs[0, self.target_layers, -self.target_tokens:, :].detach().clone().to(self.model.device)
-                    hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
-                    hidden_state_differences = hidden_state - self.normal_hidden_state
-                    orthogonality_loss = torch.nn.functional.cosine_similarity(hidden_state_differences, self.direction, dim=-1).abs().mean(dim=-1)
-                    aux_loss = orthogonality_loss
                     loss += self.config.aux_loss_weight * aux_loss
 
                 all_loss.append(loss)
