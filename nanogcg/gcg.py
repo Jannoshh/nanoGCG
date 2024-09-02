@@ -42,7 +42,7 @@ class GCGConfig:
     make_activation_orthogonal: bool = False
     aux_loss_weight: float = 1
     use_aux_loss_for_token_gradients: bool = True
-    target_tokens: int | None = None
+    target_tokens: str = 'post_suffix'
     target_layers: slice = None 
     use_prefix_cache: bool = True
     allow_non_ascii: bool = False
@@ -247,10 +247,15 @@ class GCG:
         self.after_embeds = after_embeds
         self.target_embeds = target_embeds
 
-        if config.target_tokens is None:
-            self.target_tokens = self.after_embeds.shape[1] + self.target_embeds.shape[1] # post-suffix tokens
+        if config.target_tokens == 'post_suffix_with_targets':
+            start = - (self.after_embeds.shape[1] + self.target_embeds.shape[1])
+            self.target_tokens = slice(start, None)
+        elif config.target_tokens == 'post_suffix':
+            start = - (self.after_embeds.shape[1] + self.target_embeds.shape[1])
+            end = - self.target_embeds.shape[1]
+            self.target_tokens = slice(start, end)
         else:
-            self.target_tokens = config.target_tokens
+            ValueError(f"Invalid target_tokens: {config.target_tokens}")
         
         if (self.config.use_directional_ablation or self.config.make_activation_orthogonal) and self.config.target_layers is None:
             target_layer = model.config.num_hidden_layers // 2 - 1
@@ -434,7 +439,7 @@ class GCG:
 
         if self.config.use_aux_loss_for_token_gradients:
             hs = torch.stack(hidden_states, dim=1)
-            hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
+            hidden_state = hs[:, self.target_layers, self.target_tokens, :]
             if self.config.use_directional_ablation and self.config.directional_ablation_mode == "initial":
                 aux_loss = (self.target_hidden_state - hidden_state).square().mean()
             elif self.config.use_directional_ablation and self.config.directional_ablation_mode == "current":
@@ -478,7 +483,7 @@ class GCG:
                 if self.prefix_cache:
                     if not prefix_cache_batch or current_batch_size != search_batch_size:
                         prefix_cache_batch = [[x.expand(current_batch_size, -1, -1, -1) for x in self.prefix_cache[i]] for i in range(len(self.prefix_cache))]
-
+                    
                     outputs = self.model(inputs_embeds=input_embeds_batch, past_key_values=prefix_cache_batch, output_hidden_states=output_hidden_states)
                 else:
                     outputs = self.model(inputs_embeds=input_embeds_batch, output_hidden_states=output_hidden_states)
@@ -503,9 +508,9 @@ class GCG:
                 if self.config.use_directional_ablation or self.config.make_activation_orthogonal:
                     hs = torch.stack(hidden_states, dim=1)
                     if self.normal_hidden_state is None:
-                        self.normal_hidden_state = hs[:, self.target_layers, -self.target_tokens:, :].detach().clone().to(self.model.device)
+                        self.normal_hidden_state = hs[:, self.target_layers, self.target_tokens, :].detach().clone().to(self.model.device)
                         self.target_hidden_state = self.normal_hidden_state - projection(self.normal_hidden_state, self.direction)
-                    hidden_state = hs[:, self.target_layers, -self.target_tokens:, :]
+                    hidden_state = hs[:, self.target_layers, self.target_tokens, :]
                     if self.config.use_directional_ablation and self.config.directional_ablation_mode == "initial":
                         target_hidden_state = self.target_hidden_state.expand(current_batch_size, -1, -1, -1)
                         aux_loss = (target_hidden_state - hidden_state).square()
